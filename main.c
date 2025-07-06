@@ -1,108 +1,105 @@
-// Standard C string handling
+#include <stdio.h>
+#include <math.h>
 #include <string.h>
-
-// FreeRTOS headers
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
-// ESP32 system and Wi-Fi headers
 #include "esp_wifi.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
 #include "esp_event.h"
+#include "nvs_flash.h"
 #include "esp_netif.h"
-
-// lwIP headers
 #include "lwip/sockets.h"
-#include "lwip/inet.h"
 
-#define AP_SSID "ESP32_AP_B"
-#define AP_PASS "12345678"
-#define AP_CHANNEL 6
-#define MAX_STA_CONN 4
+static const char *TAG = "CSI_RECEIVER";
+static bool is_connected = false;
 
-#define DEST_IP "192.168.4.2"   // Change to receiver STA IP if needed
-#define DEST_PORT 1234
-
-static const char *TAG = "TX_CONTINUOUS";
-
-// UDP Packet Sender Task
-void udp_sender_task(void *pvParameters)
-{
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(DEST_PORT);
-    dest_addr.sin_addr.s_addr = inet_addr(DEST_IP);
-
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "Failed to create socket: errno %d", errno);
-        vTaskDelete(NULL);
-        return;
+// Wi-Fi Event Handler
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        is_connected = false;
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        is_connected = true;
+        ESP_LOGI(TAG, "Connected to AP");
     }
-
-    char payload[] = "CSI Trigger Packet";
-
-    while (1) {
-        int err = sendto(sock, payload, strlen(payload), 0,
-                         (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-        if (err < 0) {
-            ESP_LOGE(TAG, "Send error: errno %d", errno);
-        } else {
-            ESP_LOGI(TAG, "Packet sent");
-        }
-
-        // ✅ Small delay to avoid CPU overload, Wi-Fi congestion, and crashes
-        vTaskDelay(pdMS_TO_TICKS(5));  // Delay of 1ms for safety & stability
-    }
-
-    close(sock);
-    vTaskDelete(NULL);
 }
 
-// Wi-Fi Access Point Setup
-void wifi_init_softap(void)
-{
+// CSI Callback Function
+static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info) {
+    if (!info || !info->buf || info->len == 0 || !is_connected) return;
+
+    int8_t *csi_data = info->buf;
+    int len = info->len;
+
+    char msg[1024];
+    int offset = 0;
+
+    // Calculate amplitude from (I,Q) pairs
+    for (int i = 0; i < len && (i / 2) < 64; i += 2) {
+        float amp = sqrtf(csi_data[i] * csi_data[i] + csi_data[i + 1] * csi_data[i + 1]);
+        offset += snprintf(msg + offset, sizeof(msg) - offset, "%.2f,", amp);
+        if (offset >= sizeof(msg) - 10) break; // prevent buffer overflow
+    }
+
+    if (offset > 0) {
+        msg[offset - 1] = '\0'; // remove last comma
+        printf("%s\n", msg);    // Send over UART
+    }
+}
+
+// Initialize Wi-Fi
+void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    // Register Wi-Fi events
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    // Wi-Fi config
     wifi_config_t wifi_config = {
-        .ap = {
-            .ssid = AP_SSID,
-            .ssid_len = strlen(AP_SSID),
-            .password = AP_PASS,
-            .channel = AP_CHANNEL,
-            .max_connection = MAX_STA_CONN,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK,
-            .ssid_hidden = 0,
-            .beacon_interval = 100,
+        .sta = {
+            .ssid = "ESP32_AP_B",
+            .password = "12345678",
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK
         },
     };
 
-    if (strlen(AP_PASS) == 0) {
-        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
-    }
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "SoftAP Started: SSID:%s Password:%s Channel:%d",
-             AP_SSID, AP_PASS, AP_CHANNEL);
 }
 
-// App Entry Point
-void app_main(void)
-{
+// App main
+void app_main(void) {
+    // Initialize NVS
     ESP_ERROR_CHECK(nvs_flash_init());
-    wifi_init_softap();
-    xTaskCreate(udp_sender_task, "udp_sender_task", 4096, NULL, 5, NULL);
 
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    // Initialize Wi-Fi
+    wifi_init();
+
+    // CSI configuration
+    wifi_csi_config_t csi_config = {
+        .lltf_en = true,
+        .htltf_en = true,
+        .stbc_htltf2_en = true,
+        .ltf_merge_en = true,
+        .channel_filter_en = false,
+        .manu_scale = false,
+        .shift = 0
+    };
+
+    // Set CSI config and register callback
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_cb, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+
+    ESP_LOGI(TAG, "CSI Receiver initialized. Waiting for CSI data...");
 }
